@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
@@ -44,7 +47,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	maxMem := 10 << 30
+	maxMem := 1 << 30
 	err = r.ParseMultipartForm(int64(maxMem))
 
 	file, fileHeader, err := r.FormFile("video")
@@ -82,6 +85,11 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusBadRequest, "failed to write to temp file", err)
 		return
 	}
+	ratio, err := getVideoAspectRatio(temp.Name())
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, fmt.Sprintf("failed to get video aspect: %s", err.Error()), err)
+		return
+	}
 	temp.Seek(0, io.SeekStart)
 
 	rdm := make([]byte, 32)
@@ -89,6 +97,17 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	rdmId := base64.RawURLEncoding.EncodeToString(rdm)
 	fileKey := fmt.Sprintf("%s.mp4", rdmId)
+
+	switch ratio {
+	case "16:9":
+		fileKey = fmt.Sprintf("landscape/%s", fileKey)
+	case "9:16":
+		fileKey = fmt.Sprintf("portrait/%s", fileKey)
+	default:
+		fileKey = fmt.Sprintf("other/%s", fileKey)
+
+	}
+
 	opts := s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
 		Key:         &fileKey,
@@ -110,4 +129,36 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, video)
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	command := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+
+	var stdout bytes.Buffer
+	command.Stdout = &stdout
+
+	if err := command.Run(); err != nil {
+		return "", err
+	}
+	var result map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		return "", err
+	}
+
+	streams, ok := result["streams"].([]any)
+	if !ok {
+		return "", fmt.Errorf("streams not in result")
+	}
+	ratio, ok := streams[0].(map[string]any)["display_aspect_ratio"].(string)
+	if !ok {
+		return "", fmt.Errorf("could not find display_aspect_ratio")
+	}
+
+	switch ratio {
+	case "16:9", "9:16":
+		return ratio, nil
+
+	default:
+		return "other", nil
+	}
 }
